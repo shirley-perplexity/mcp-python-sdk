@@ -47,6 +47,11 @@ mcp = "mcp.cli:app [cli]"
 default-groups = ["dev", "docs"]
 required-version = ">=0.7.2"
 
+[[tool.uv.index]]
+name = "pplx-ai"
+url = "https://pplx-ai-699753309705.d.codeartifact.us-east-1.amazonaws.com/pypi/pplx-ai/simple/"
+publish-url = "https://pplx-ai-699753309705.d.codeartifact.us-east-1.amazonaws.com/pypi/pplx-ai/"
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.391",
