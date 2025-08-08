@@ -399,10 +399,17 @@ class StreamableHTTPTransport:
                     )
 
                     async def handle_request_async():
-                        if is_resumption:
-                            await self._handle_resumption_request(ctx)
-                        else:
-                            await self._handle_post_request(ctx)
+                        try:
+                            if is_resumption:
+                                await self._handle_resumption_request(ctx)
+                            else:
+                                await self._handle_post_request(ctx)
+                        except Exception as e:
+                            # Send exception to main session for proper error handling
+                            try:
+                                await ctx.read_stream_writer.send(e)
+                            except Exception as e:
+                                logger.exception(f"Failed to send exception to read stream: {e}")
 
                     # If this is a request, start a new task to handle it
                     if isinstance(message.root, JSONRPCRequest):
