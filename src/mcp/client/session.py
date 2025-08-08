@@ -57,10 +57,11 @@ class MessageHandlerFnT(Protocol):
 async def _default_message_handler(
     message: RequestResponder[types.ServerRequest, types.ClientResult] | types.ServerNotification | Exception,
 ) -> None:
+    await anyio.lowlevel.checkpoint()
+    
     if isinstance(message, Exception):
         # Re-raise exceptions so they propagate back to the application
         raise message
-    await anyio.lowlevel.checkpoint()
 
 
 async def _default_sampling_callback(
