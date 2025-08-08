@@ -126,8 +126,9 @@ async def sse_client(
                                     )
                                     response.raise_for_status()
                                     logger.debug(f"Client message sent successfully: {response.status_code}")
-                        except Exception:
+                        except Exception as exc:
                             logger.exception("Error in post_writer")
+                            await read_stream_writer.send(exc)
                         finally:
                             await write_stream.aclose()
 

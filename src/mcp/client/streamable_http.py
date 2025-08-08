@@ -417,8 +417,9 @@ class StreamableHTTPTransport:
                     else:
                         await handle_request_async()
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Error in post_writer")
+            await read_stream_writer.send(exc)
         finally:
             await read_stream_writer.aclose()
             await write_stream.aclose()
