@@ -204,6 +204,9 @@ class OAuthClientProvider(httpx.Auth):
         )
         self._initialized = False
 
+        # State parameter for CSRF protection
+        self.auth_state: str | None = None
+
     def _extract_resource_metadata_from_www_auth(self, init_response: httpx.Response) -> str | None:
         """
         Extract protected resource metadata URL from WWW-Authenticate header as per RFC9728.
@@ -322,13 +325,13 @@ class OAuthClientProvider(httpx.Auth):
 
         # Generate PKCE parameters
         pkce_params = PKCEParameters.generate()
-        state = secrets.token_urlsafe(32)
+        self.auth_state = secrets.token_urlsafe(32)
 
         auth_params = {
             "response_type": "code",
             "client_id": self.context.client_info.client_id,
             "redirect_uri": str(self.context.client_metadata.redirect_uris[0]),
-            "state": state,
+            "state": self.auth_state,
             "code_challenge": pkce_params.code_challenge,
             "code_challenge_method": "S256",
         }
@@ -346,8 +349,10 @@ class OAuthClientProvider(httpx.Auth):
         # Wait for callback
         auth_code, returned_state = await self.context.callback_handler()
 
-        if returned_state is None or not secrets.compare_digest(returned_state, state):
-            raise OAuthFlowError(f"State parameter mismatch: {returned_state} != {state}")
+        if returned_state is None or not secrets.compare_digest(returned_state, self.auth_state):
+            raise OAuthFlowError(f"State parameter mismatch: {returned_state} != {self.auth_state}")
+
+        self.auth_state = None
 
         if not auth_code:
             raise OAuthFlowError("No authorization code received")
