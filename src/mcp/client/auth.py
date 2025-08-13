@@ -349,9 +349,11 @@ class OAuthClientProvider(httpx.Auth):
         # Wait for callback
         auth_code, returned_state = await self.context.callback_handler()
 
+        # Validate state parameter for CSRF protection
         if returned_state is None or not secrets.compare_digest(returned_state, self.auth_state):
             raise OAuthFlowError(f"State parameter mismatch: {returned_state} != {self.auth_state}")
 
+        # Clear state after validation
         self.auth_state = None
 
         if not auth_code:
@@ -487,6 +489,62 @@ class OAuthClientProvider(httpx.Auth):
         if self.context.client_metadata.scope is None and metadata.scopes_supported is not None:
             self.context.client_metadata.scope = " ".join(metadata.scopes_supported)
 
+    async def _ensure_token(self) -> None:
+        """Ensure valid access token, refreshing or re-authenticating as needed."""
+        # Return early if token is valid
+        if self.context.is_token_valid():
+            return
+
+        # Try refreshing existing token
+        if self.context.can_refresh_token():
+            try:
+                refresh_request = await self._refresh_token()
+                async with httpx.AsyncClient(timeout=self.context.timeout) as client:
+                    refresh_response = await client.send(refresh_request)
+                    if await self._handle_refresh_response(refresh_response):
+                        return  # Refresh succeeded
+            except Exception:
+                logger.warning("Token refresh failed, will perform full OAuth flow")
+        
+        # Fall back to full OAuth flow
+        await self._perform_oauth_flow()
+
+    async def _perform_oauth_flow(self) -> None:
+        """Execute OAuth2 authorization code flow with PKCE."""
+        logger.debug("Starting OAuth authentication flow")
+        
+        async with httpx.AsyncClient(timeout=self.context.timeout) as client:
+            # Step 1: Discover protected resource metadata (if we have a 401 response)
+            # Note: We can't access the 401 response here, so skip PRM discovery
+            
+            # Step 2: Discover OAuth metadata
+            discovery_urls = self._get_discovery_urls()
+            for url in discovery_urls:
+                oauth_metadata_request = self._create_oauth_metadata_request(url)
+                oauth_metadata_response = await client.send(oauth_metadata_request)
+                if oauth_metadata_response.status_code == 200:
+                    try:
+                        await self._handle_oauth_metadata_response(oauth_metadata_response)
+                        break
+                    except ValidationError:
+                        continue
+                elif oauth_metadata_response.status_code < 400 or oauth_metadata_response.status_code >= 500:
+                    break
+
+            # Step 3: Register client if needed
+            registration_request = await self._register_client()
+            if registration_request:
+                registration_response = await client.send(registration_request)
+                await self._handle_registration_response(registration_response)
+
+            # Step 4: Perform authorization
+            auth_code, code_verifier = await self._perform_authorization()
+
+            # Step 5: Exchange authorization code for tokens
+            token_request = await self._exchange_token(auth_code, code_verifier)
+            token_response = await client.send(token_request)
+            await self._handle_token_response(token_response)
+
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         """HTTPX auth flow integration."""
         async with self.context.lock:
@@ -496,61 +554,32 @@ class OAuthClientProvider(httpx.Auth):
             # Capture protocol version from request headers
             self.context.protocol_version = request.headers.get(MCP_PROTOCOL_VERSION)
 
-            if not self.context.is_token_valid() and self.context.can_refresh_token():
-                # Try to refresh token
-                refresh_request = await self._refresh_token()
-                refresh_response = yield refresh_request
+            # Ensure we have a valid token
+            await self._ensure_token()
+            
+            # Add auth header
+            self._add_auth_header(request)
 
-                if not await self._handle_refresh_response(refresh_response):
-                    # Refresh failed, need full re-authentication
-                    self._initialized = False
-
-            if self.context.is_token_valid():
-                self._add_auth_header(request)
-
+            # Send the request
             response = yield request
 
+            # Handle 401 - clear tokens and retry once
             if response.status_code == 401:
-                # Perform full OAuth flow
+                logger.debug("Got 401 response, clearing tokens and retrying")
+                self.context.clear_tokens()
+                
+                # Try to extract protected resource metadata from 401 response
                 try:
-                    # OAuth flow must be inline due to generator constraints
-                    # Step 1: Discover protected resource metadata (RFC9728 with WWW-Authenticate support)
-                    discovery_request = await self._discover_protected_resource(response)
-                    discovery_response = yield discovery_request
-                    await self._handle_protected_resource_response(discovery_response)
-
-                    # Step 2: Discover OAuth metadata (with fallback for legacy servers)
-                    discovery_urls = self._get_discovery_urls()
-                    for url in discovery_urls:
-                        oauth_metadata_request = self._create_oauth_metadata_request(url)
-                        oauth_metadata_response = yield oauth_metadata_request
-
-                        if oauth_metadata_response.status_code == 200:
-                            try:
-                                await self._handle_oauth_metadata_response(oauth_metadata_response)
-                                break
-                            except ValidationError:
-                                continue
-                        elif oauth_metadata_response.status_code < 400 or oauth_metadata_response.status_code >= 500:
-                            break  # Non-4XX error, stop trying
-
-                    # Step 3: Register client if needed
-                    registration_request = await self._register_client()
-                    if registration_request:
-                        registration_response = yield registration_request
-                        await self._handle_registration_response(registration_response)
-
-                    # Step 4: Perform authorization
-                    auth_code, code_verifier = await self._perform_authorization()
-
-                    # Step 5: Exchange authorization code for tokens
-                    token_request = await self._exchange_token(auth_code, code_verifier)
-                    token_response = yield token_request
-                    await self._handle_token_response(token_response)
+                    async with httpx.AsyncClient(timeout=self.context.timeout) as client:
+                        discovery_request = await self._discover_protected_resource(response)
+                        discovery_response = await client.send(discovery_request)
+                        await self._handle_protected_resource_response(discovery_response)
                 except Exception:
-                    logger.exception("OAuth flow error")
-                    raise
-
-        # Retry with new tokens
-        self._add_auth_header(request)
-        yield request
+                    logger.debug("Failed to discover protected resource metadata")
+                
+                # Perform full OAuth flow
+                await self._perform_oauth_flow()
+                
+                # Retry request with new tokens
+                self._add_auth_header(request)
+                response = yield request
