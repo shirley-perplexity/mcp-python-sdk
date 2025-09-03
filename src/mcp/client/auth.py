@@ -82,6 +82,13 @@ class TokenStorage(Protocol):
 
 
 @dataclass
+class OAuthEndpoints:
+    """Custom OAuth endpoints that can be specified to skip discovery."""
+    authorization_endpoint: str
+    token_endpoint: str
+
+
+@dataclass
 class OAuthContext:
     """OAuth flow context."""
 
@@ -91,6 +98,9 @@ class OAuthContext:
     redirect_handler: Callable[[str], Awaitable[None]]
     callback_handler: Callable[[], Awaitable[tuple[str, str | None]]]
     timeout: float = 300.0
+
+    # Custom endpoints (skips discovery if provided)
+    oauth_endpoints: OAuthEndpoints | None = None
 
     # Discovered metadata
     protected_resource_metadata: ProtectedResourceMetadata | None = None
@@ -192,10 +202,12 @@ class OAuthClientProvider(httpx.Auth):
         redirect_handler: Callable[[str], Awaitable[None]],
         callback_handler: Callable[[], Awaitable[tuple[str, str | None]]],
         timeout: float = 300.0,
+        oauth_endpoints: OAuthEndpoints | None = None,
     ):
         """Initialize OAuth2 authentication."""
         self.context = OAuthContext(
             server_url=server_url,
+            oauth_endpoints=oauth_endpoints,
             client_metadata=client_metadata,
             storage=storage,
             redirect_handler=redirect_handler,
@@ -314,7 +326,10 @@ class OAuthClientProvider(httpx.Auth):
 
     async def _perform_authorization(self) -> tuple[str, str]:
         """Perform the authorization redirect and get auth code."""
-        if self.context.oauth_metadata and self.context.oauth_metadata.authorization_endpoint:
+        # Check custom endpoints first, then discovered metadata, then fallback
+        if self.context.oauth_endpoints:
+            auth_endpoint = self.context.oauth_endpoints.authorization_endpoint
+        elif self.context.oauth_metadata and self.context.oauth_metadata.authorization_endpoint:
             auth_endpoint = str(self.context.oauth_metadata.authorization_endpoint)
         else:
             auth_base_url = self.context.get_authorization_base_url(self.context.server_url)
@@ -367,7 +382,10 @@ class OAuthClientProvider(httpx.Auth):
         if not self.context.client_info:
             raise OAuthFlowError("Missing client info")
 
-        if self.context.oauth_metadata and self.context.oauth_metadata.token_endpoint:
+        # Check custom endpoints first, then discovered metadata, then fallback
+        if self.context.oauth_endpoints:
+            token_url = self.context.oauth_endpoints.token_endpoint
+        elif self.context.oauth_metadata and self.context.oauth_metadata.token_endpoint:
             token_url = str(self.context.oauth_metadata.token_endpoint)
         else:
             auth_base_url = self.context.get_authorization_base_url(self.context.server_url)
@@ -423,7 +441,10 @@ class OAuthClientProvider(httpx.Auth):
         if not self.context.client_info:
             raise OAuthTokenError("No client info available")
 
-        if self.context.oauth_metadata and self.context.oauth_metadata.token_endpoint:
+        # Check custom endpoints first, then discovered metadata, then fallback
+        if self.context.oauth_endpoints:
+            token_url = self.context.oauth_endpoints.token_endpoint
+        elif self.context.oauth_metadata and self.context.oauth_metadata.token_endpoint:
             token_url = str(self.context.oauth_metadata.token_endpoint)
         else:
             auth_base_url = self.context.get_authorization_base_url(self.context.server_url)
@@ -517,19 +538,20 @@ class OAuthClientProvider(httpx.Auth):
             # Step 1: Discover protected resource metadata (if we have a 401 response)
             # Note: We can't access the 401 response here, so skip PRM discovery
             
-            # Step 2: Discover OAuth metadata
-            discovery_urls = self._get_discovery_urls()
-            for url in discovery_urls:
-                oauth_metadata_request = self._create_oauth_metadata_request(url)
-                oauth_metadata_response = await client.send(oauth_metadata_request)
-                if oauth_metadata_response.status_code == 200:
-                    try:
-                        await self._handle_oauth_metadata_response(oauth_metadata_response)
+            # Step 2: Discover OAuth metadata (skip if custom endpoints are provided)
+            if not self.context.oauth_endpoints:
+                discovery_urls = self._get_discovery_urls()
+                for url in discovery_urls:
+                    oauth_metadata_request = self._create_oauth_metadata_request(url)
+                    oauth_metadata_response = await client.send(oauth_metadata_request)
+                    if oauth_metadata_response.status_code == 200:
+                        try:
+                            await self._handle_oauth_metadata_response(oauth_metadata_response)
+                            break
+                        except ValidationError:
+                            continue
+                    elif oauth_metadata_response.status_code < 400 or oauth_metadata_response.status_code >= 500:
                         break
-                    except ValidationError:
-                        continue
-                elif oauth_metadata_response.status_code < 400 or oauth_metadata_response.status_code >= 500:
-                    break
 
             # Step 3: Register client if needed
             registration_request = await self._register_client()
