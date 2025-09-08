@@ -97,6 +97,7 @@ class OAuthContext:
     storage: TokenStorage
     redirect_handler: Callable[[str], Awaitable[None]]
     callback_handler: Callable[[], Awaitable[tuple[str, str | None]]]
+    generate_auth_state: Callable[[], Awaitable[str]] | None = None
     timeout: float = 300.0
 
     # Custom endpoints (skips discovery if provided)
@@ -201,6 +202,7 @@ class OAuthClientProvider(httpx.Auth):
         storage: TokenStorage,
         redirect_handler: Callable[[str], Awaitable[None]],
         callback_handler: Callable[[], Awaitable[tuple[str, str | None]]],
+        generate_auth_state: Callable[[], Awaitable[str]] | None = None,
         timeout: float = 300.0,
         oauth_endpoints: OAuthEndpoints | None = None,
     ):
@@ -212,12 +214,10 @@ class OAuthClientProvider(httpx.Auth):
             storage=storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
+            generate_auth_state=generate_auth_state,
             timeout=timeout,
         )
         self._initialized = False
-
-        # State parameter for CSRF protection
-        self.auth_state: str | None = None
 
     def _extract_resource_metadata_from_www_auth(self, init_response: httpx.Response) -> str | None:
         """
@@ -340,13 +340,17 @@ class OAuthClientProvider(httpx.Auth):
 
         # Generate PKCE parameters
         pkce_params = PKCEParameters.generate()
-        self.auth_state = secrets.token_urlsafe(32)
+        state = (
+            await self.context.generate_auth_state()
+            if self.context.generate_auth_state
+            else secrets.token_urlsafe(32)
+        )
 
         auth_params = {
             "response_type": "code",
             "client_id": self.context.client_info.client_id,
             "redirect_uri": str(self.context.client_metadata.redirect_uris[0]),
-            "state": self.auth_state,
+            "state": state,
             "code_challenge": pkce_params.code_challenge,
             "code_challenge_method": "S256",
         }
@@ -365,11 +369,8 @@ class OAuthClientProvider(httpx.Auth):
         auth_code, returned_state = await self.context.callback_handler()
 
         # Validate state parameter for CSRF protection
-        if returned_state is None or not secrets.compare_digest(returned_state, self.auth_state):
-            raise OAuthFlowError(f"State parameter mismatch: {returned_state} != {self.auth_state}")
-
-        # Clear state after validation
-        self.auth_state = None
+        if returned_state is None or not secrets.compare_digest(returned_state, state):
+            raise OAuthFlowError(f"State parameter mismatch: {returned_state} != {state}")
 
         if not auth_code:
             raise OAuthFlowError("No authorization code received")
@@ -424,8 +425,12 @@ class OAuthClientProvider(httpx.Auth):
 
             # Validate scopes
             if token_response.scope and self.context.client_metadata.scope:
-                requested_scopes = set(self.context.client_metadata.scope.split())
-                returned_scopes = set(token_response.scope.split())
+                def parse_scopes(scope_string: str) -> set[str]:
+                    """Parse scopes that may be separated by spaces or commas."""
+                    return set(re.split(r'[,\s]+', scope_string.strip()))
+                
+                requested_scopes = parse_scopes(self.context.client_metadata.scope)
+                returned_scopes = parse_scopes(token_response.scope)
                 unauthorized_scopes = returned_scopes - requested_scopes
                 if unauthorized_scopes:
                     raise OAuthTokenError(f"Server granted unauthorized scopes: {unauthorized_scopes}")
