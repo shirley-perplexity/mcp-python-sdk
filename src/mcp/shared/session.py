@@ -173,7 +173,7 @@ class BaseSession(
     messages when entered.
     """
 
-    _response_streams: dict[RequestId, MemoryObjectSendStream[JSONRPCResponse | JSONRPCError]]
+    _response_streams: dict[RequestId, MemoryObjectSendStream[JSONRPCResponse | JSONRPCError | Exception]]
     _request_id: int
     _in_flight: dict[RequestId, RequestResponder[ReceiveRequestT, SendResultT]]
     _progress_callbacks: dict[RequestId, ProgressFnT]
@@ -236,7 +236,7 @@ class BaseSession(
         request_id = self._request_id
         self._request_id = request_id + 1
 
-        response_stream, response_stream_reader = anyio.create_memory_object_stream[JSONRPCResponse | JSONRPCError](1)
+        response_stream, response_stream_reader = anyio.create_memory_object_stream[JSONRPCResponse | JSONRPCError | Exception](1)
         self._response_streams[request_id] = response_stream
 
         # Set up progress token if progress callback is provided
@@ -284,6 +284,8 @@ class BaseSession(
 
             if isinstance(response_or_error, JSONRPCError):
                 raise McpError(response_or_error.error)
+            elif isinstance(response_or_error, Exception):
+                raise response_or_error
             else:
                 return result_type.model_validate(response_or_error.result)
 
@@ -413,25 +415,19 @@ class BaseSession(
                                 RuntimeError(f"Received response with an unknown request ID: {message}")
                             )
 
-            except anyio.ClosedResourceError:
-                # This is expected when the client disconnects abruptly.
-                # Without this handler, the exception would propagate up and
-                # crash the server's task group.
-                logging.debug("Read stream closed by client")
             except Exception as e:
-                # Other exceptions are not expected and should be logged. We purposefully
-                # catch all exceptions here to avoid crashing the server.
-                logging.exception(f"Unhandled exception in receive loop: {e}")
-            finally:
-                # after the read stream is closed, we need to send errors
-                # to any pending requests
-                for id, stream in self._response_streams.items():
-                    error = ErrorData(code=CONNECTION_CLOSED, message="Connection closed")
+                logging.warning(f"Exception in receive loop: {e}")
+                # Send the exception to all waiting response streams
+                for stream in self._response_streams.values():
                     try:
-                        await stream.send(JSONRPCError(jsonrpc="2.0", id=id, error=error))
+                        await stream.send(e)
+                    except Exception:
+                        pass
+            finally:
+                for stream in self._response_streams.values():
+                    try:
                         await stream.aclose()
                     except Exception:
-                        # Stream might already be closed
                         pass
                 self._response_streams.clear()
 
